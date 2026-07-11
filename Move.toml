@@ -1,0 +1,10 @@
+[package]
+name = "lyra"
+edition = "2024"
+license = "MIT"
+authors = ["Lyra AI"]
+
+# Framework dependencies (Sui, MoveStdlib) are implicit on Sui 1.45+.
+# Named addresses are derived from the package name on Sui CLI 1.63+,
+# so there is no [addresses] section.
+[dependencies]

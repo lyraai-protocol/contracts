@@ -1,0 +1,42 @@
+name: contracts
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# The Move package is offline to build/test except for fetching the pinned Sui
+# framework from git (per Move.lock). No secrets or network endpoints needed.
+jobs:
+  move:
+    name: build + test
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Sui CLI (latest mainnet release)
+        run: |
+          set -euo pipefail
+          TAG=$(curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/MystenLabs/sui/releases \
+            | python3 -c "import sys,json;print(next(r['tag_name'] for r in json.load(sys.stdin) if r['tag_name'].startswith('mainnet-')))")
+          echo "Installing Sui $TAG"
+          URL="https://github.com/MystenLabs/sui/releases/download/${TAG}/sui-${TAG}-ubuntu-x86_64.tgz"
+          curl -fsSL "$URL" -o sui.tgz
+          mkdir -p "$HOME/.sui-bin"
+          tar -xzf sui.tgz -C "$HOME/.sui-bin"
+          SUI=$(find "$HOME/.sui-bin" -maxdepth 2 -type f -name sui | head -1)
+          chmod +x "$SUI"
+          echo "$(dirname "$SUI")" >> "$GITHUB_PATH"
+
+      - name: Sui version
+        run: sui --version
+
+      - name: Build
+        run: sui move build
+
+      - name: Test
+        run: sui move test
