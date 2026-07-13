@@ -75,6 +75,49 @@ fun blocks_over_budget() {
     clock::destroy_for_testing(clk);
 }
 
+#[test, expected_failure(abort_code = lyra::policy::EOverWindow)]
+/// Two spends inside one rolling window that together exceed the window budget:
+/// the second aborts, even though each is within the per-tx cap AND the lifetime
+/// budget. This is the blast-radius bound a single PTB can't loop around.
+fun window_caps_burst() {
+    let mut ctx = tx_context::dummy();
+    let clk = clock::create_for_testing(&mut ctx);
+    // lifetime budget 10_000, per-tx 500, window 1000ms / 600 per window.
+    let (mut policy, cap) =
+        policy::new_windowed_policy_for_testing(AGENT, 10_000, 500, 1000, 600, &mut ctx);
+    let r1 = policy.enforce_spend<SUI>(400, @0x0, b"swap", b"", &clk, &mut ctx);
+    destroy(r1);
+    // 400 + 300 = 700 > 600 window budget, same window (clock unchanged) → aborts.
+    let r2 = policy.enforce_spend<SUI>(300, @0x0, b"swap", b"", &clk, &mut ctx);
+    destroy(r2);
+    destroy(policy);
+    destroy(cap);
+    clock::destroy_for_testing(clk);
+}
+
+#[test]
+/// Once the window elapses the allowance resets, so a spend that would have
+/// exceeded the previous window succeeds after time passes; the lifetime budget
+/// keeps accumulating across windows.
+fun window_resets_after_elapse() {
+    let mut ctx = tx_context::dummy();
+    let mut clk = clock::create_for_testing(&mut ctx);
+    let (mut policy, cap) =
+        policy::new_windowed_policy_for_testing(AGENT, 10_000, 500, 1000, 600, &mut ctx);
+    let r1 = policy.enforce_spend<SUI>(400, @0x0, b"swap", b"", &clk, &mut ctx);
+    assert!(policy.window_spent_mist() == 400);
+    destroy(r1);
+    // Advance past the window; the next spend resets the window allowance.
+    clock::increment_for_testing(&mut clk, 1001);
+    let r2 = policy.enforce_spend<SUI>(500, @0x0, b"swap", b"", &clk, &mut ctx);
+    assert!(policy.window_spent_mist() == 500); // reset, then charged
+    assert!(policy.spent_mist() == 900); // lifetime keeps accumulating
+    destroy(r2);
+    destroy(policy);
+    destroy(cap);
+    clock::destroy_for_testing(clk);
+}
+
 #[test, expected_failure(abort_code = lyra::policy::ERevoked)]
 fun blocks_when_revoked() {
     let mut ctx = tx_context::dummy();
