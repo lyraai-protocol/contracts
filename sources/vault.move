@@ -40,6 +40,10 @@ const ENotVaultOwner: u64 = 2;
 const EWrongVersion: u64 = 3;
 /// `migrate` was called on a vault that is already at the current version.
 const ENotUpgrade: u64 = 4;
+/// `vault_spend_capped` was called with the no-protocol sentinel: the capped raw
+/// draw is only for NAMED protocol actions (staking/lending), so it stays gated by
+/// the protocol allowlist. Sends use `vault_transfer`; swaps use `vault_borrow`.
+const ENotProtocolAction: u64 = 5;
 
 // === Structs ===
 
@@ -248,11 +252,38 @@ public fun vault_settle<U>(vault: &mut Vault<U>, flash: FlashSpend, returned: Co
     });
 }
 
+/// Draw a coin for a protocol action whose output is NOT a coin that can be
+/// returned to the vault — native staking (→ a `StakedSui` object) or lending
+/// supply (→ an address/account position). The agent gets the raw coin to pass
+/// into the protocol call in the SAME PTB. Unlike `vault_borrow`, nothing is
+/// settled back, so this is the ONLY path with standing exposure — deliberately
+/// bounded by the rolling per-window budget (a compromised agent can misdirect at
+/// most one window's budget). Requires a NAMED protocol (never the no-protocol
+/// sentinel), so it stays gated by the protocol allowlist. Sends must use
+/// `vault_transfer` (recipient-checked); swaps use `vault_borrow`/`vault_settle`
+/// (funds return to a vault — zero standing exposure).
+public fun vault_spend_capped<T>(
+    vault: &mut Vault<T>,
+    policy: &mut AgentPolicy,
+    amount_mist: u64,
+    protocol: address,
+    kind: vector<u8>,
+    memo: vector<u8>,
+    clock: &Clock,
+    ctx: &mut TxContext,
+): Coin<T> {
+    assert!(protocol != constants::no_protocol(), ENotProtocolAction);
+    let (coin, receipt) = spend_internal<T>(vault, policy, amount_mist, protocol, kind, memo, clock, ctx);
+    transfer::public_transfer(receipt, policy::owner(policy));
+    coin
+}
+
 /// Recipient-checked transfer from the vault. Enforces the policy's optional
 /// recipient allowlist ON-CHAIN, then draws `amount_mist` via the full policy gate
 /// and sends it to `recipient`; the receipt goes to the owner. With a recipient
 /// allowlist set, a prompt-injected or compromised agent can only pay the owner's
-/// approved payees — and there is no raw-coin path to route around this.
+/// approved payees on THIS path — the settle-backed `vault_borrow` returns funds to
+/// the vault, and `vault_spend_capped` is window-bounded + named-protocol only.
 public fun vault_transfer<T>(
     vault: &mut Vault<T>,
     policy: &mut AgentPolicy,

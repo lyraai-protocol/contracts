@@ -224,6 +224,49 @@ fun foreign_cap_cannot_open_vault() {
     destroy(foreign);
 }
 
+#[test]
+/// The window-bounded capped draw works for a NAMED protocol (staking/lending):
+/// the agent gets the raw coin and spend accounting moves.
+fun capped_spend_for_named_protocol() {
+    let mut ctx = tx_context::dummy();
+    let clk = clock::create_for_testing(&mut ctx);
+    let (mut policy, cap) =
+        policy::new_policy_for_testing(AGENT, 1000, 1000, 0, vector[], vector[], &mut ctx);
+    let mut v = vault::new<SUI>(&policy, &mut ctx);
+    vault::deposit(&mut v, coin::mint_for_testing<SUI>(1000, &mut ctx));
+
+    let c =
+        vault::vault_spend_capped<SUI>(&mut v, &mut policy, 300, @0x1234, b"stake", b"", &clk, &mut ctx);
+    assert!(c.value() == 300);
+    assert!(vault::value(&v) == 700);
+
+    destroy(c);
+    destroy(v);
+    destroy(policy);
+    destroy(cap);
+    clock::destroy_for_testing(clk);
+}
+
+#[test, expected_failure(abort_code = lyra::vault::ENotProtocolAction)]
+/// The capped draw rejects the no-protocol sentinel — it is not a generic drain
+/// (sends must go through the recipient-checked vault_transfer).
+fun capped_spend_rejects_no_protocol() {
+    let mut ctx = tx_context::dummy();
+    let clk = clock::create_for_testing(&mut ctx);
+    let (mut policy, cap) =
+        policy::new_policy_for_testing(AGENT, 1000, 1000, 0, vector[], vector[], &mut ctx);
+    let mut v = vault::new<SUI>(&policy, &mut ctx);
+    vault::deposit(&mut v, coin::mint_for_testing<SUI>(1000, &mut ctx));
+
+    let c =
+        vault::vault_spend_capped<SUI>(&mut v, &mut policy, 300, @0x0, b"stake", b"", &clk, &mut ctx);
+    destroy(c);
+    destroy(v);
+    destroy(policy);
+    destroy(cap);
+    clock::destroy_for_testing(clk);
+}
+
 // === Version guard ===
 
 #[test, expected_failure(abort_code = lyra::vault::EWrongVersion)]
