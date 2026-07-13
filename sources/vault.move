@@ -1,17 +1,25 @@
 /// Lyra — non-custodial treasury vault.
 ///
-/// The upgrade that makes Lyra production-grade. User funds live in an on-chain
-/// `Vault`, NOT in the agent's EOA. The delegated agent can only draw funds via
-/// `vault_spend`, which re-runs the full `lyra::policy` gate on-chain (agent
-/// identity, budget, per-tx cap, coin/protocol allowlists, expiry, revoke,
-/// version). So a compromised agent key — or even a leaked server signing key —
-/// is bounded by the policy and revocable by the owner, who can also pull the
-/// whole treasury back at any time with `owner_withdraw`. The platform never has
-/// unbounded access to user funds; the agent is a delegate, not a custodian.
+/// User funds live in an on-chain `Vault<T>`, NOT in the agent's EOA. The vault is
+/// generic over the coin type `T`, so one owner can hold several — `Vault<SUI>`,
+/// `Vault<USDC>`, any bridged asset — all bound to the same `AgentPolicy`.
 ///
-/// Version guard: the agent spend path asserts the vault is at the running
-/// package version, but `deposit` and `owner_withdraw` never do — so an upgrade
-/// can pause agent spending without ever trapping the owner's funds.
+/// The delegated agent has exactly two ways to move funds out, and NEITHER hands
+/// it a coin it can keep:
+///   • `vault_transfer` — sends to a recipient, enforcing the policy's recipient
+///     allowlist on-chain.
+///   • `vault_borrow` + `vault_settle` — draws a coin for a protocol action (swap /
+///     lend / stake) as a `FlashSpend` HOT POTATO that must be settled by
+///     depositing the resulting asset back into a same-policy vault.
+/// Both re-run the full `lyra::policy` gate on-chain (agent identity, per-tx cap,
+/// rolling window + lifetime budget, coin/protocol allowlists, expiry, revoke,
+/// version). So a compromised agent key — or a leaked server signing key — is
+/// bounded by the policy and the per-window budget, and revocable by the owner,
+/// who can also pull the whole treasury back anytime with `owner_withdraw`.
+///
+/// Version guard: the agent spend path asserts the vault is at the running package
+/// version, but `deposit` and `owner_withdraw` never do — so an upgrade can pause
+/// agent spending without ever trapping the owner's funds.
 module lyra::vault;
 
 use lyra::constants;
@@ -70,7 +78,10 @@ public struct VaultMigrated has copy, drop { vault_id: ID, from_version: u16, to
 
 // === Open / fund ===
 
-/// Construct a vault bound to `policy` (composable). Caller becomes the owner.
+/// Construct a vault bound to `policy` (composable, no sharing). Used internally
+/// by `provision` and `open`; the returned `Vault<T>` has only `key`, so callers
+/// cannot store, transfer, or share it themselves — the only way it becomes a live
+/// shared object is through this module's own `open`/`provision`, both authorized.
 public fun new<T>(policy: &AgentPolicy, ctx: &mut TxContext): Vault<T> {
     let vault = Vault<T> {
         id: object::new(ctx),
@@ -87,8 +98,12 @@ public fun new<T>(policy: &AgentPolicy, ctx: &mut TxContext): Vault<T> {
     vault
 }
 
-/// Open + share a treasury vault of coin type `T`, bound to `policy`.
-entry fun open<T>(policy: &AgentPolicy, ctx: &mut TxContext) {
+/// Open + share an ADDITIONAL treasury vault of coin type `T` under an existing
+/// policy — owner-gated, so only the policy owner can add asset vaults (e.g. a
+/// `Vault<USDC>` for bridged deposits alongside a `Vault<SUI>`). First-time setup
+/// uses `provision` instead. Fund it afterwards with `deposit` (open to anyone).
+entry fun open<T>(policy: &AgentPolicy, cap: &PolicyOwnerCap, ctx: &mut TxContext) {
+    assert!(policy::owner_cap_policy_id(cap) == object::id(policy), ENotVaultOwner);
     transfer::share_object(new<T>(policy, ctx));
 }
 

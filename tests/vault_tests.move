@@ -199,6 +199,31 @@ fun settle_into_foreign_vault_aborts() {
     clock::destroy_for_testing(clk);
 }
 
+#[test]
+/// The owner can open an ADDITIONAL asset vault under their policy (multi-asset:
+/// e.g. a Vault<USDC> alongside a Vault<SUI> for bridged deposits).
+fun owner_opens_additional_asset_vault() {
+    let mut ctx = tx_context::dummy();
+    let (policy, cap) =
+        policy::new_policy_for_testing(AGENT, 1000, 1000, 0, vector[], vector[], &mut ctx);
+    vault::open<SUI>(&policy, &cap, &mut ctx); // shares a new same-policy vault; no abort
+    destroy(policy);
+    destroy(cap);
+}
+
+#[test, expected_failure(abort_code = lyra::vault::ENotVaultOwner)]
+/// A foreign cap cannot open a vault bound to someone else's policy.
+fun foreign_cap_cannot_open_vault() {
+    let mut ctx = tx_context::dummy();
+    let (policy, cap) =
+        policy::new_policy_for_testing(AGENT, 1000, 1000, 0, vector[], vector[], &mut ctx);
+    let foreign = policy::foreign_cap_for_testing(&mut ctx);
+    vault::open<SUI>(&policy, &foreign, &mut ctx); // aborts ENotVaultOwner
+    destroy(policy);
+    destroy(cap);
+    destroy(foreign);
+}
+
 // === Version guard ===
 
 #[test, expected_failure(abort_code = lyra::vault::EWrongVersion)]

@@ -3,14 +3,18 @@
 /// Lyra's thesis: the AI is advisory; fund controls are enforced in deterministic
 /// on-chain code, NOT by the model. An `AgentPolicy` is a shared object created by
 /// an owner that bounds what a delegated agent address may do: a lifetime budget
-/// and per-tx cap (in MIST), an allowed coin-type list, an allowed protocol-package
-/// list, an optional transfer-recipient list, an expiry, and a revoke switch.
+/// AND a rolling per-window budget (the real blast-radius bound — a single tx can't
+/// loop spends up to the lifetime cap), a per-tx cap (in MIST), an allowed coin-type
+/// list, an allowed protocol-package list, an optional transfer-recipient list, an
+/// expiry, and a revoke switch.
 ///
 /// The agent calls `enforce_spend` inside the SAME programmable transaction block
-/// that moves the funds. The call aborts if the action is out of policy, and
-/// otherwise records the spend and mints a `receipt::ActionReceipt` for the audit
-/// trail. Because the limits live on-chain, even a fully compromised off-chain
-/// agent cannot exceed them — that is why Lyra runs on Sui.
+/// that moves the funds (via `lyra::vault`'s `vault_transfer` or the
+/// `vault_borrow`/`vault_settle` hot-potato). The call aborts if the action is out
+/// of policy, and otherwise charges the budget + window and mints a
+/// `receipt::ActionReceipt` for the audit trail. Because the limits live on-chain,
+/// even a fully compromised off-chain agent is bounded by them — that is why Lyra
+/// runs on Sui.
 ///
 /// Module map:
 /// - `lyra::constants` — version + the `@0x0` no-protocol sentinel.
