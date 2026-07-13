@@ -8,13 +8,14 @@ use sui::clock;
 use sui::coin;
 use sui::sui::SUI;
 
-// tx_context::dummy() sender — set as the policy agent so vault_spend passes the
-// on-chain agent check by default.
+// tx_context::dummy() sender — set as the policy agent so the spend gate passes
+// the on-chain agent check by default.
 const AGENT: address = @0x0;
 
 #[test]
-/// The agent draws funds from the vault under policy; balance + spend accounting move.
-fun agent_spends_from_vault_within_policy() {
+/// The agent borrows funds under policy; balance + spend accounting move, then the
+/// hot potato is settled back into the vault (the mandatory round-trip).
+fun agent_borrows_and_settles_within_policy() {
     let mut ctx = tx_context::dummy();
     let clk = clock::create_for_testing(&mut ctx);
     let (mut policy, cap) =
@@ -24,14 +25,16 @@ fun agent_spends_from_vault_within_policy() {
     vault::deposit(&mut v, coin::mint_for_testing<SUI>(1000, &mut ctx));
     assert!(vault::value(&v) == 1000);
 
-    let (c, r) =
-        vault::vault_spend<SUI>(&mut v, &mut policy, 400, @0x0, b"transfer", b"", &clk, &mut ctx);
+    let (c, flash) =
+        vault::vault_borrow<SUI>(&mut v, &mut policy, 400, @0x0, b"swap", b"", &clk, &mut ctx);
     assert!(c.value() == 400);
     assert!(vault::value(&v) == 600);
     assert!(policy.spent_mist() == 400);
 
-    destroy(c);
-    destroy(r);
+    // Settle the borrowed coin back into the same-policy vault (funds return).
+    vault::vault_settle<SUI>(&mut v, flash, c);
+    assert!(vault::value(&v) == 1000);
+
     destroy(v);
     destroy(policy);
     destroy(cap);
@@ -39,18 +42,17 @@ fun agent_spends_from_vault_within_policy() {
 }
 
 #[test, expected_failure]
-/// A spend over the per-tx cap aborts inside the policy gate — even with funds present.
-fun blocks_spend_over_per_tx_cap() {
+/// A borrow over the per-tx cap aborts inside the policy gate — even with funds present.
+fun blocks_borrow_over_per_tx_cap() {
     let mut ctx = tx_context::dummy();
     let clk = clock::create_for_testing(&mut ctx);
     let (mut policy, cap) =
         policy::new_policy_for_testing(AGENT, 10_000, 500, 0, vector[], vector[], &mut ctx);
     let mut v = vault::new<SUI>(&policy, &mut ctx);
     vault::deposit(&mut v, coin::mint_for_testing<SUI>(10_000, &mut ctx));
-    let (c, r) =
-        vault::vault_spend<SUI>(&mut v, &mut policy, 501, @0x0, b"transfer", b"", &clk, &mut ctx);
-    destroy(c);
-    destroy(r);
+    let (c, flash) =
+        vault::vault_borrow<SUI>(&mut v, &mut policy, 501, @0x0, b"swap", b"", &clk, &mut ctx);
+    vault::vault_settle<SUI>(&mut v, flash, c);
     destroy(v);
     destroy(policy);
     destroy(cap);
@@ -59,17 +61,16 @@ fun blocks_spend_over_per_tx_cap() {
 
 #[test, expected_failure]
 /// In-policy but the vault lacks the funds → aborts (EInsufficientVault).
-fun blocks_spend_exceeding_vault_balance() {
+fun blocks_borrow_exceeding_vault_balance() {
     let mut ctx = tx_context::dummy();
     let clk = clock::create_for_testing(&mut ctx);
     let (mut policy, cap) =
         policy::new_policy_for_testing(AGENT, 10_000, 10_000, 0, vector[], vector[], &mut ctx);
     let mut v = vault::new<SUI>(&policy, &mut ctx);
     vault::deposit(&mut v, coin::mint_for_testing<SUI>(100, &mut ctx));
-    let (c, r) =
-        vault::vault_spend<SUI>(&mut v, &mut policy, 500, @0x0, b"transfer", b"", &clk, &mut ctx);
-    destroy(c);
-    destroy(r);
+    let (c, flash) =
+        vault::vault_borrow<SUI>(&mut v, &mut policy, 500, @0x0, b"swap", b"", &clk, &mut ctx);
+    vault::vault_settle<SUI>(&mut v, flash, c);
     destroy(v);
     destroy(policy);
     destroy(cap);
@@ -117,7 +118,7 @@ fun recipient_allowlist_permits_listed_payee() {
 
 #[test, expected_failure]
 /// A transfer to an UNLISTED recipient aborts, even within budget (the key
-/// prompt-injection mitigation).
+/// prompt-injection mitigation). There is no raw-coin path around this now.
 fun recipient_allowlist_blocks_unlisted_payee() {
     let mut ctx = tx_context::dummy();
     let clk = clock::create_for_testing(&mut ctx);
@@ -168,6 +169,104 @@ fun foreign_cap_cannot_withdraw() {
     destroy(cap2);
 }
 
+#[test, expected_failure]
+/// A `FlashSpend` cannot be settled into a vault bound to a DIFFERENT policy —
+/// funds must return to the borrower's own (owner's) vault.
+fun settle_into_foreign_vault_aborts() {
+    let mut ctx = tx_context::dummy();
+    let clk = clock::create_for_testing(&mut ctx);
+    let (mut policy, cap) =
+        policy::new_policy_for_testing(AGENT, 1000, 1000, 0, vector[], vector[], &mut ctx);
+    let mut v = vault::new<SUI>(&policy, &mut ctx);
+    vault::deposit(&mut v, coin::mint_for_testing<SUI>(1000, &mut ctx));
+
+    // A second, unrelated policy + its vault.
+    let (policy2, cap2) =
+        policy::new_policy_for_testing(AGENT, 1000, 1000, 0, vector[], vector[], &mut ctx);
+    let mut v2 = vault::new<SUI>(&policy2, &mut ctx);
+
+    let (c, flash) =
+        vault::vault_borrow<SUI>(&mut v, &mut policy, 100, @0x0, b"swap", b"", &clk, &mut ctx);
+    // Settling into v2 (foreign policy) must abort (EWrongVault).
+    vault::vault_settle<SUI>(&mut v2, flash, c);
+
+    destroy(v);
+    destroy(v2);
+    destroy(policy);
+    destroy(cap);
+    destroy(policy2);
+    destroy(cap2);
+    clock::destroy_for_testing(clk);
+}
+
+#[test]
+/// The owner can open an ADDITIONAL asset vault under their policy (multi-asset:
+/// e.g. a Vault<USDC> alongside a Vault<SUI> for bridged deposits).
+fun owner_opens_additional_asset_vault() {
+    let mut ctx = tx_context::dummy();
+    let (policy, cap) =
+        policy::new_policy_for_testing(AGENT, 1000, 1000, 0, vector[], vector[], &mut ctx);
+    vault::open<SUI>(&policy, &cap, &mut ctx); // shares a new same-policy vault; no abort
+    destroy(policy);
+    destroy(cap);
+}
+
+#[test, expected_failure(abort_code = lyra::vault::ENotVaultOwner)]
+/// A foreign cap cannot open a vault bound to someone else's policy.
+fun foreign_cap_cannot_open_vault() {
+    let mut ctx = tx_context::dummy();
+    let (policy, cap) =
+        policy::new_policy_for_testing(AGENT, 1000, 1000, 0, vector[], vector[], &mut ctx);
+    let foreign = policy::foreign_cap_for_testing(&mut ctx);
+    vault::open<SUI>(&policy, &foreign, &mut ctx); // aborts ENotVaultOwner
+    destroy(policy);
+    destroy(cap);
+    destroy(foreign);
+}
+
+#[test]
+/// The window-bounded capped draw works for a NAMED protocol (staking/lending):
+/// the agent gets the raw coin and spend accounting moves.
+fun capped_spend_for_named_protocol() {
+    let mut ctx = tx_context::dummy();
+    let clk = clock::create_for_testing(&mut ctx);
+    let (mut policy, cap) =
+        policy::new_policy_for_testing(AGENT, 1000, 1000, 0, vector[], vector[], &mut ctx);
+    let mut v = vault::new<SUI>(&policy, &mut ctx);
+    vault::deposit(&mut v, coin::mint_for_testing<SUI>(1000, &mut ctx));
+
+    let c =
+        vault::vault_spend_capped<SUI>(&mut v, &mut policy, 300, @0x1234, b"stake", b"", &clk, &mut ctx);
+    assert!(c.value() == 300);
+    assert!(vault::value(&v) == 700);
+
+    destroy(c);
+    destroy(v);
+    destroy(policy);
+    destroy(cap);
+    clock::destroy_for_testing(clk);
+}
+
+#[test, expected_failure(abort_code = lyra::vault::ENotProtocolAction)]
+/// The capped draw rejects the no-protocol sentinel — it is not a generic drain
+/// (sends must go through the recipient-checked vault_transfer).
+fun capped_spend_rejects_no_protocol() {
+    let mut ctx = tx_context::dummy();
+    let clk = clock::create_for_testing(&mut ctx);
+    let (mut policy, cap) =
+        policy::new_policy_for_testing(AGENT, 1000, 1000, 0, vector[], vector[], &mut ctx);
+    let mut v = vault::new<SUI>(&policy, &mut ctx);
+    vault::deposit(&mut v, coin::mint_for_testing<SUI>(1000, &mut ctx));
+
+    let c =
+        vault::vault_spend_capped<SUI>(&mut v, &mut policy, 300, @0x0, b"stake", b"", &clk, &mut ctx);
+    destroy(c);
+    destroy(v);
+    destroy(policy);
+    destroy(cap);
+    clock::destroy_for_testing(clk);
+}
+
 // === Version guard ===
 
 #[test, expected_failure(abort_code = lyra::vault::EWrongVersion)]
@@ -181,10 +280,9 @@ fun stale_vault_blocks_agent_spend() {
     vault::deposit(&mut v, coin::mint_for_testing<SUI>(1000, &mut ctx));
     vault::set_version_for_testing(&mut v, 0); // pretend an upgrade moved past this vault
 
-    let (c, r) =
-        vault::vault_spend<SUI>(&mut v, &mut policy, 100, @0x0, b"transfer", b"", &clk, &mut ctx);
-    destroy(c);
-    destroy(r);
+    let (c, flash) =
+        vault::vault_borrow<SUI>(&mut v, &mut policy, 100, @0x0, b"swap", b"", &clk, &mut ctx);
+    vault::vault_settle<SUI>(&mut v, flash, c);
     destroy(v);
     destroy(policy);
     destroy(cap);
@@ -224,13 +322,12 @@ fun migrate_restores_agent_spend() {
     vault::set_version_for_testing(&mut v, 0); // stale
     vault::migrate<SUI>(&mut v, &cap); // owner brings it current
 
-    let (c, r) =
-        vault::vault_spend<SUI>(&mut v, &mut policy, 100, @0x0, b"transfer", b"", &clk, &mut ctx);
+    let (c, flash) =
+        vault::vault_borrow<SUI>(&mut v, &mut policy, 100, @0x0, b"swap", b"", &clk, &mut ctx);
     assert!(c.value() == 100);
     assert!(vault::value(&v) == 900);
+    vault::vault_settle<SUI>(&mut v, flash, c);
 
-    destroy(c);
-    destroy(r);
     destroy(v);
     destroy(policy);
     destroy(cap);

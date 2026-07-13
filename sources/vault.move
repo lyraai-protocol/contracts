@@ -1,17 +1,25 @@
 /// Lyra — non-custodial treasury vault.
 ///
-/// The upgrade that makes Lyra production-grade. User funds live in an on-chain
-/// `Vault`, NOT in the agent's EOA. The delegated agent can only draw funds via
-/// `vault_spend`, which re-runs the full `lyra::policy` gate on-chain (agent
-/// identity, budget, per-tx cap, coin/protocol allowlists, expiry, revoke,
-/// version). So a compromised agent key — or even a leaked server signing key —
-/// is bounded by the policy and revocable by the owner, who can also pull the
-/// whole treasury back at any time with `owner_withdraw`. The platform never has
-/// unbounded access to user funds; the agent is a delegate, not a custodian.
+/// User funds live in an on-chain `Vault<T>`, NOT in the agent's EOA. The vault is
+/// generic over the coin type `T`, so one owner can hold several — `Vault<SUI>`,
+/// `Vault<USDC>`, any bridged asset — all bound to the same `AgentPolicy`.
 ///
-/// Version guard: the agent spend path asserts the vault is at the running
-/// package version, but `deposit` and `owner_withdraw` never do — so an upgrade
-/// can pause agent spending without ever trapping the owner's funds.
+/// The delegated agent has exactly two ways to move funds out, and NEITHER hands
+/// it a coin it can keep:
+///   • `vault_transfer` — sends to a recipient, enforcing the policy's recipient
+///     allowlist on-chain.
+///   • `vault_borrow` + `vault_settle` — draws a coin for a protocol action (swap /
+///     lend / stake) as a `FlashSpend` HOT POTATO that must be settled by
+///     depositing the resulting asset back into a same-policy vault.
+/// Both re-run the full `lyra::policy` gate on-chain (agent identity, per-tx cap,
+/// rolling window + lifetime budget, coin/protocol allowlists, expiry, revoke,
+/// version). So a compromised agent key — or a leaked server signing key — is
+/// bounded by the policy and the per-window budget, and revocable by the owner,
+/// who can also pull the whole treasury back anytime with `owner_withdraw`.
+///
+/// Version guard: the agent spend path asserts the vault is at the running package
+/// version, but `deposit` and `owner_withdraw` never do — so an upgrade can pause
+/// agent spending without ever trapping the owner's funds.
 module lyra::vault;
 
 use lyra::constants;
@@ -32,6 +40,10 @@ const ENotVaultOwner: u64 = 2;
 const EWrongVersion: u64 = 3;
 /// `migrate` was called on a vault that is already at the current version.
 const ENotUpgrade: u64 = 4;
+/// `vault_spend_capped` was called with the no-protocol sentinel: the capped raw
+/// draw is only for NAMED protocol actions (staking/lending), so it stays gated by
+/// the protocol allowlist. Sends use `vault_transfer`; swaps use `vault_borrow`.
+const ENotProtocolAction: u64 = 5;
 
 // === Structs ===
 
@@ -55,13 +67,25 @@ public struct VaultDeposited has copy, drop { vault_id: ID, amount: u64, balance
 
 public struct VaultSpent has copy, drop { vault_id: ID, policy_id: ID, amount: u64, balance: u64 }
 
+public struct VaultSettled has copy, drop {
+    vault_id: ID,
+    policy_id: ID,
+    borrowed: u64,
+    returned: u64,
+    protocol: address,
+    balance: u64,
+}
+
 public struct VaultWithdrawn has copy, drop { vault_id: ID, amount: u64, by: address }
 
 public struct VaultMigrated has copy, drop { vault_id: ID, from_version: u16, to_version: u16 }
 
 // === Open / fund ===
 
-/// Construct a vault bound to `policy` (composable). Caller becomes the owner.
+/// Construct a vault bound to `policy` (composable, no sharing). Used internally
+/// by `provision` and `open`; the returned `Vault<T>` has only `key`, so callers
+/// cannot store, transfer, or share it themselves — the only way it becomes a live
+/// shared object is through this module's own `open`/`provision`, both authorized.
 public fun new<T>(policy: &AgentPolicy, ctx: &mut TxContext): Vault<T> {
     let vault = Vault<T> {
         id: object::new(ctx),
@@ -78,8 +102,12 @@ public fun new<T>(policy: &AgentPolicy, ctx: &mut TxContext): Vault<T> {
     vault
 }
 
-/// Open + share a treasury vault of coin type `T`, bound to `policy`.
-entry fun open<T>(policy: &AgentPolicy, ctx: &mut TxContext) {
+/// Open + share an ADDITIONAL treasury vault of coin type `T` under an existing
+/// policy — owner-gated, so only the policy owner can add asset vaults (e.g. a
+/// `Vault<USDC>` for bridged deposits alongside a `Vault<SUI>`). First-time setup
+/// uses `provision` instead. Fund it afterwards with `deposit` (open to anyone).
+entry fun open<T>(policy: &AgentPolicy, cap: &PolicyOwnerCap, ctx: &mut TxContext) {
+    assert!(policy::owner_cap_policy_id(cap) == object::id(policy), ENotVaultOwner);
     transfer::share_object(new<T>(policy, ctx));
 }
 
@@ -92,6 +120,8 @@ entry fun provision<T>(
     agent: address,
     budget_mist: u64,
     max_per_tx_mist: u64,
+    window_ms: u64,
+    window_budget_mist: u64,
     max_slippage_bps: u64,
     allowed_coins: vector<vector<u8>>,
     allowed_protocols: vector<address>,
@@ -104,6 +134,8 @@ entry fun provision<T>(
         agent,
         budget_mist,
         max_per_tx_mist,
+        window_ms,
+        window_budget_mist,
         max_slippage_bps,
         allowed_coins,
         allowed_protocols,
@@ -137,13 +169,24 @@ entry fun deposit_entry<T>(vault: &mut Vault<T>, coin: Coin<T>) {
 
 // === Spend (agent, policy-enforced) ===
 
-/// The policy-enforced spend. The delegated agent draws `amount_mist` of `T` from
-/// the vault, gated by the full on-chain policy via `policy::enforce_spend`
-/// (aborts unless the SENDER is the agent and the action is within budget, per-tx
-/// cap, coin/protocol allowlists, expiry, version, and the policy is not revoked).
-/// Returns the `Coin<T>` for the agent to use in the SAME PTB (transfer / swap /
-/// supply) plus the audit `ActionReceipt`.
-public fun vault_spend<T>(
+/// A hot-potato proof that funds were drawn from a vault and MUST be returned. It
+/// has NO abilities (no drop/store/key/copy), so the only thing a PTB can do with
+/// it is pass it to `vault_settle` — which deposits value back into a vault under
+/// the SAME policy. This is what removes the old unchecked-exit hole: the agent can
+/// no longer draw a raw coin and keep it, and the recipient allowlist on
+/// `vault_transfer` is now meaningful (there is no raw-coin path around it).
+public struct FlashSpend {
+    policy_id: ID,
+    borrowed: u64,
+    protocol: address,
+}
+
+/// The ONE internal path that removes funds from the vault balance. Runs the full
+/// on-chain policy gate (agent identity, budget, per-tx cap, rolling window,
+/// coin/protocol allowlists, expiry, version, revoke) and returns the coin + the
+/// audit `ActionReceipt`. Not public — callers use `vault_transfer` (checked send)
+/// or `vault_borrow`+`vault_settle` (protocol round-trip).
+fun spend_internal<T>(
     vault: &mut Vault<T>,
     policy: &mut AgentPolicy,
     amount_mist: u64,
@@ -167,12 +210,80 @@ public fun vault_spend<T>(
     (coin, receipt)
 }
 
+/// Borrow funds for a protocol action (swap / supply / stake). Runs the full
+/// policy gate, hands the agent the `Coin<T>` to use in the SAME PTB, and returns
+/// a `FlashSpend` hot potato that MUST be consumed by `vault_settle` — depositing
+/// the resulting asset (swap output / receipt token / change) back into a vault
+/// under the same policy. So drawn funds cannot be pocketed: they have to come
+/// back into the owner's vault. The audit receipt goes to the owner.
+public fun vault_borrow<T>(
+    vault: &mut Vault<T>,
+    policy: &mut AgentPolicy,
+    amount_mist: u64,
+    protocol: address,
+    kind: vector<u8>,
+    memo: vector<u8>,
+    clock: &Clock,
+    ctx: &mut TxContext,
+): (Coin<T>, FlashSpend) {
+    let policy_id = object::id(policy);
+    let (coin, receipt) = spend_internal<T>(vault, policy, amount_mist, protocol, kind, memo, clock, ctx);
+    transfer::public_transfer(receipt, policy::owner(policy));
+    (coin, FlashSpend { policy_id, borrowed: amount_mist, protocol })
+}
+
+/// Settle a `FlashSpend`: deposit `returned` (of any coin type `U` — the protocol's
+/// output may differ from what was borrowed) into a vault bound to the SAME policy,
+/// then destroy the hot potato. The destination vault is cap-gated for withdrawal,
+/// so whatever is settled is recoverable only by the owner. The emitted event
+/// records borrowed vs returned for off-chain audit.
+public fun vault_settle<U>(vault: &mut Vault<U>, flash: FlashSpend, returned: Coin<U>) {
+    let FlashSpend { policy_id, borrowed, protocol } = flash;
+    assert!(vault.policy_id == policy_id, EWrongVault);
+    let returned_amount = returned.value();
+    balance::join(&mut vault.balance, returned.into_balance());
+    event::emit(VaultSettled {
+        vault_id: object::id(vault),
+        policy_id,
+        borrowed,
+        returned: returned_amount,
+        protocol,
+        balance: vault.balance.value(),
+    });
+}
+
+/// Draw a coin for a protocol action whose output is NOT a coin that can be
+/// returned to the vault — native staking (→ a `StakedSui` object) or lending
+/// supply (→ an address/account position). The agent gets the raw coin to pass
+/// into the protocol call in the SAME PTB. Unlike `vault_borrow`, nothing is
+/// settled back, so this is the ONLY path with standing exposure — deliberately
+/// bounded by the rolling per-window budget (a compromised agent can misdirect at
+/// most one window's budget). Requires a NAMED protocol (never the no-protocol
+/// sentinel), so it stays gated by the protocol allowlist. Sends must use
+/// `vault_transfer` (recipient-checked); swaps use `vault_borrow`/`vault_settle`
+/// (funds return to a vault — zero standing exposure).
+public fun vault_spend_capped<T>(
+    vault: &mut Vault<T>,
+    policy: &mut AgentPolicy,
+    amount_mist: u64,
+    protocol: address,
+    kind: vector<u8>,
+    memo: vector<u8>,
+    clock: &Clock,
+    ctx: &mut TxContext,
+): Coin<T> {
+    assert!(protocol != constants::no_protocol(), ENotProtocolAction);
+    let (coin, receipt) = spend_internal<T>(vault, policy, amount_mist, protocol, kind, memo, clock, ctx);
+    transfer::public_transfer(receipt, policy::owner(policy));
+    coin
+}
+
 /// Recipient-checked transfer from the vault. Enforces the policy's optional
 /// recipient allowlist ON-CHAIN, then draws `amount_mist` via the full policy gate
-/// (`vault_spend`) and sends it to `recipient`; the receipt goes to the owner.
-/// This is the hardened path for agent transfers — with a recipient allowlist set,
-/// a prompt-injected or compromised agent can still only pay the owner's approved
-/// payees, even within budget.
+/// and sends it to `recipient`; the receipt goes to the owner. With a recipient
+/// allowlist set, a prompt-injected or compromised agent can only pay the owner's
+/// approved payees on THIS path — the settle-backed `vault_borrow` returns funds to
+/// the vault, and `vault_spend_capped` is window-bounded + named-protocol only.
 public fun vault_transfer<T>(
     vault: &mut Vault<T>,
     policy: &mut AgentPolicy,
@@ -184,7 +295,7 @@ public fun vault_transfer<T>(
 ) {
     policy::assert_recipient_allowed(policy, recipient);
     let no_protocol = constants::no_protocol();
-    let (coin, receipt) = vault_spend<T>(
+    let (coin, receipt) = spend_internal<T>(
         vault,
         policy,
         amount_mist,

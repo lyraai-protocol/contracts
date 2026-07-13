@@ -3,14 +3,18 @@
 /// Lyra's thesis: the AI is advisory; fund controls are enforced in deterministic
 /// on-chain code, NOT by the model. An `AgentPolicy` is a shared object created by
 /// an owner that bounds what a delegated agent address may do: a lifetime budget
-/// and per-tx cap (in MIST), an allowed coin-type list, an allowed protocol-package
-/// list, an optional transfer-recipient list, an expiry, and a revoke switch.
+/// AND a rolling per-window budget (the real blast-radius bound — a single tx can't
+/// loop spends up to the lifetime cap), a per-tx cap (in MIST), an allowed coin-type
+/// list, an allowed protocol-package list, an optional transfer-recipient list, an
+/// expiry, and a revoke switch.
 ///
 /// The agent calls `enforce_spend` inside the SAME programmable transaction block
-/// that moves the funds. The call aborts if the action is out of policy, and
-/// otherwise records the spend and mints a `receipt::ActionReceipt` for the audit
-/// trail. Because the limits live on-chain, even a fully compromised off-chain
-/// agent cannot exceed them — that is why Lyra runs on Sui.
+/// that moves the funds (via `lyra::vault`'s `vault_transfer` or the
+/// `vault_borrow`/`vault_settle` hot-potato). The call aborts if the action is out
+/// of policy, and otherwise charges the budget + window and mints a
+/// `receipt::ActionReceipt` for the audit trail. Because the limits live on-chain,
+/// even a fully compromised off-chain agent is bounded by them — that is why Lyra
+/// runs on Sui.
 ///
 /// Module map:
 /// - `lyra::constants` — version + the `@0x0` no-protocol sentinel.
@@ -43,6 +47,8 @@ const ERecipientNotAllowed: u64 = 9;
 const EWrongVersion: u64 = 10;
 /// `migrate` was called on a policy that is already at the current version.
 const ENotUpgrade: u64 = 11;
+/// The spend would exceed the rolling per-window budget (blast-radius bound).
+const EOverWindow: u64 = 12;
 
 // === Structs ===
 
@@ -63,6 +69,15 @@ public struct AgentPolicy has key {
     spent_mist: u64,
     /// Hard cap for a single action, in MIST.
     max_per_tx_mist: u64,
+    /// Rolling spend window — the real blast-radius bound. `window_ms == 0`
+    /// disables it (only the lifetime budget applies). Otherwise at most
+    /// `window_budget_mist` may be spent per `window_ms`; the window resets once it
+    /// elapses. This stops a single PTB (or a short burst) from looping spends to
+    /// drain the whole lifetime budget at once.
+    window_ms: u64,
+    window_budget_mist: u64,
+    window_spent_mist: u64,
+    window_start_ms: u64,
     /// Reference slippage cap (bps). Enforced off-chain against live quotes;
     /// stored here so the bound is auditable on-chain.
     max_slippage_bps: u64,
@@ -123,6 +138,8 @@ public fun new_policy(
     agent: address,
     budget_mist: u64,
     max_per_tx_mist: u64,
+    window_ms: u64,
+    window_budget_mist: u64,
     max_slippage_bps: u64,
     allowed_coins: vector<vector<u8>>,
     allowed_protocols: vector<address>,
@@ -131,6 +148,7 @@ public fun new_policy(
     ctx: &mut TxContext,
 ): (AgentPolicy, PolicyOwnerCap) {
     let owner = ctx.sender();
+    let now = clock.timestamp_ms();
     let policy = AgentPolicy {
         id: object::new(ctx),
         version: constants::version(),
@@ -139,13 +157,17 @@ public fun new_policy(
         budget_mist,
         spent_mist: 0,
         max_per_tx_mist,
+        window_ms,
+        window_budget_mist,
+        window_spent_mist: 0,
+        window_start_ms: now,
         max_slippage_bps,
         allowed_coins,
         allowed_protocols,
         allowed_recipients: vector[],
         expiry_ms,
         revoked: false,
-        created_ms: clock.timestamp_ms(),
+        created_ms: now,
     };
     let policy_id = object::id(&policy);
     let cap = PolicyOwnerCap { id: object::new(ctx), policy_id };
@@ -172,6 +194,8 @@ entry fun create_policy(
     agent: address,
     budget_mist: u64,
     max_per_tx_mist: u64,
+    window_ms: u64,
+    window_budget_mist: u64,
     max_slippage_bps: u64,
     allowed_coins: vector<vector<u8>>,
     allowed_protocols: vector<address>,
@@ -183,6 +207,8 @@ entry fun create_policy(
         agent,
         budget_mist,
         max_per_tx_mist,
+        window_ms,
+        window_budget_mist,
         max_slippage_bps,
         allowed_coins,
         allowed_protocols,
@@ -221,6 +247,21 @@ public fun enforce_spend<T>(
     assert!(amount_mist <= policy.max_per_tx_mist, EOverPerTxCap);
     assert!(policy.spent_mist + amount_mist <= policy.budget_mist, EOverBudget);
 
+    // Rolling-window blast-radius bound: reset the window if it has elapsed, then
+    // cap the spend within it. This is what stops a single PTB from looping spends
+    // up to the full lifetime budget. `window_ms == 0` disables the window.
+    if (policy.window_ms > 0) {
+        if (now >= policy.window_start_ms + policy.window_ms) {
+            policy.window_start_ms = now;
+            policy.window_spent_mist = 0;
+        };
+        assert!(
+            policy.window_spent_mist + amount_mist <= policy.window_budget_mist,
+            EOverWindow,
+        );
+        policy.window_spent_mist = policy.window_spent_mist + amount_mist;
+    };
+
     let coin_type = type_name::with_defining_ids<T>().into_string().into_bytes();
     assert!(coin_allowed(policy, &coin_type), ECoinNotAllowed);
     assert!(protocol_allowed(policy, protocol), EProtocolNotAllowed);
@@ -241,11 +282,13 @@ public fun enforce_spend<T>(
     )
 }
 
-/// Entry wrapper around `enforce_spend`: records the action and delivers the
-/// `ActionReceipt` to the policy owner. Use this for a standalone receipt write;
-/// use `enforce_spend` to compose with a fund movement in one PTB.
+/// Standalone AUDIT receipt write — records that an action happened, WITHOUT
+/// charging the budget. `enforce_spend` (which does charge) is the only path that
+/// moves the spend accounting; a bare log entry must never consume budget, or the
+/// agent could exhaust it (griefing) with actions that move no vault funds. Still
+/// agent- and version-gated so only the delegated agent can write these.
 entry fun record_action<T>(
-    policy: &mut AgentPolicy,
+    policy: &AgentPolicy,
     amount_mist: u64,
     protocol: address,
     kind: vector<u8>,
@@ -253,9 +296,23 @@ entry fun record_action<T>(
     clock: &Clock,
     ctx: &mut TxContext,
 ) {
-    let owner = policy.owner;
-    let receipt = enforce_spend<T>(policy, amount_mist, protocol, kind, memo, clock, ctx);
-    transfer::public_transfer(receipt, owner);
+    assert_current_version(policy);
+    assert!(ctx.sender() == policy.agent, ENotAgent);
+    assert!(!policy.revoked, ERevoked);
+    let coin_type = type_name::with_defining_ids<T>().into_string().into_bytes();
+    let receipt = receipt::issue(
+        object::id(policy),
+        policy.agent,
+        kind,
+        coin_type,
+        protocol,
+        amount_mist,
+        policy.spent_mist, // unchanged — audit-only, does not consume budget
+        memo,
+        clock.timestamp_ms(),
+        ctx,
+    );
+    transfer::public_transfer(receipt, policy.owner);
 }
 
 /// Pure, read-only preview used by tests and off-chain dry-runs: true when an
@@ -449,6 +506,12 @@ public fun remaining_mist(policy: &AgentPolicy): u64 { policy.budget_mist - poli
 
 public fun max_per_tx_mist(policy: &AgentPolicy): u64 { policy.max_per_tx_mist }
 
+public fun window_ms(policy: &AgentPolicy): u64 { policy.window_ms }
+
+public fun window_budget_mist(policy: &AgentPolicy): u64 { policy.window_budget_mist }
+
+public fun window_spent_mist(policy: &AgentPolicy): u64 { policy.window_spent_mist }
+
 public fun max_slippage_bps(policy: &AgentPolicy): u64 { policy.max_slippage_bps }
 
 public fun expiry_ms(policy: &AgentPolicy): u64 { policy.expiry_ms }
@@ -528,11 +591,50 @@ public fun new_policy_for_testing(
         budget_mist,
         spent_mist: 0,
         max_per_tx_mist,
+        window_ms: 0,
+        window_budget_mist: 0,
+        window_spent_mist: 0,
+        window_start_ms: 0,
         max_slippage_bps: 100,
         allowed_coins,
         allowed_protocols,
         allowed_recipients: vector[],
         expiry_ms,
+        revoked: false,
+        created_ms: 0,
+    };
+    let cap = PolicyOwnerCap { id: object::new(ctx), policy_id: object::id(&policy) };
+    (policy, cap)
+}
+
+#[test_only]
+/// Like `new_policy_for_testing` but with the rolling window armed, so tests can
+/// exercise the per-window blast-radius bound. `window_start_ms` seeds at 0.
+public fun new_windowed_policy_for_testing(
+    agent: address,
+    budget_mist: u64,
+    max_per_tx_mist: u64,
+    window_ms: u64,
+    window_budget_mist: u64,
+    ctx: &mut TxContext,
+): (AgentPolicy, PolicyOwnerCap) {
+    let policy = AgentPolicy {
+        id: object::new(ctx),
+        version: constants::version(),
+        owner: ctx.sender(),
+        agent,
+        budget_mist,
+        spent_mist: 0,
+        max_per_tx_mist,
+        window_ms,
+        window_budget_mist,
+        window_spent_mist: 0,
+        window_start_ms: 0,
+        max_slippage_bps: 100,
+        allowed_coins: vector[],
+        allowed_protocols: vector[],
+        allowed_recipients: vector[],
+        expiry_ms: 0,
         revoked: false,
         created_ms: 0,
     };
