@@ -60,7 +60,7 @@ sui move test       # run the unit + integration suite (tests/)
 
 ## Deployment
 
-Live on **Sui mainnet**: `0x8b2412e9a5d931cafa533d29daf8c91edacda28d6a689cbdecacf2a092380e14`
+Live on **Sui mainnet**: `0xcd6943c0c4397f9d56c908f6e6952056bf469aa062afc7be9af358aba8fe15c5`
 (full record — `published-at`, `original-id`, `upgrade-capability` — in `Published.toml`).
 
 This is a **fresh publish**, not an upgrade: the model-B rework changed struct layouts
