@@ -233,6 +233,59 @@ fun top_up_raises_budget() {
     destroy(policy);
 }
 
+#[test]
+fun set_max_per_tx_lifts_the_cap() {
+    let mut ctx = tx_context::dummy();
+    let clk = clock::create_for_testing(&mut ctx);
+    let (mut policy, cap) = mk(10_000, 500, 0, vector[], vector[], &mut ctx);
+    // 800 would exceed the initial 500 per-tx cap; raise the cap, then it goes through.
+    policy.set_max_per_tx(&cap, 9_000);
+    assert!(policy.max_per_tx_mist() == 9_000);
+    let r = policy.enforce_spend<SUI>(800, @0x0, b"transfer", b"", &clk, &mut ctx);
+    assert!(policy.spent_mist() == 800);
+    destroy(r);
+    destroy(cap);
+    destroy(policy);
+    clock::destroy_for_testing(clk);
+}
+
+#[test]
+fun set_budget_and_window_budget_update() {
+    let mut ctx = tx_context::dummy();
+    let (mut policy, cap) = mk(500, 500, 0, vector[], vector[], &mut ctx);
+    policy.set_budget(&cap, 20_000);
+    assert!(policy.budget_mist() == 20_000);
+    policy.set_window_budget(&cap, 5_000);
+    assert!(policy.window_budget_mist() == 5_000);
+    destroy(cap);
+    destroy(policy);
+}
+
+#[test, expected_failure(abort_code = lyra::policy::EBudgetBelowSpent)]
+fun set_budget_below_spent_aborts() {
+    let mut ctx = tx_context::dummy();
+    let clk = clock::create_for_testing(&mut ctx);
+    let (mut policy, cap) = mk(10_000, 5_000, 0, vector[], vector[], &mut ctx);
+    let r = policy.enforce_spend<SUI>(4_000, @0x0, b"transfer", b"", &clk, &mut ctx);
+    // 4_000 already spent; setting the budget below that must abort.
+    policy.set_budget(&cap, 3_000);
+    destroy(r);
+    destroy(cap);
+    destroy(policy);
+    clock::destroy_for_testing(clk);
+}
+
+#[test, expected_failure(abort_code = lyra::policy::EWrongPolicy)]
+fun set_max_per_tx_rejects_foreign_cap() {
+    let mut ctx = tx_context::dummy();
+    let (mut policy, cap) = mk(500, 500, 0, vector[], vector[], &mut ctx);
+    let foreign = policy::foreign_cap_for_testing(&mut ctx);
+    policy.set_max_per_tx(&foreign, 9_000);
+    destroy(cap);
+    destroy(foreign);
+    destroy(policy);
+}
+
 #[test, expected_failure(abort_code = lyra::policy::EWrongPolicy)]
 fun rejects_foreign_owner_cap() {
     let mut ctx = tx_context::dummy();
