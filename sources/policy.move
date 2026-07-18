@@ -49,6 +49,9 @@ const EWrongVersion: u64 = 10;
 const ENotUpgrade: u64 = 11;
 /// The spend would exceed the rolling per-window budget (blast-radius bound).
 const EOverWindow: u64 = 12;
+/// `set_budget` below what has already been spent would break the spent <= budget
+/// invariant; refuse it.
+const EBudgetBelowSpent: u64 = 13;
 
 // === Structs ===
 
@@ -128,6 +131,12 @@ public struct RecipientsSet has copy, drop { policy_id: ID, count: u64 }
 public struct ProtocolAllowlistChanged has copy, drop { policy_id: ID, count: u64 }
 
 public struct CoinAllowlistChanged has copy, drop { policy_id: ID, count: u64 }
+
+public struct MaxPerTxSet has copy, drop { policy_id: ID, max_per_tx_mist: u64 }
+
+public struct BudgetSet has copy, drop { policy_id: ID, budget_mist: u64 }
+
+public struct WindowBudgetSet has copy, drop { policy_id: ID, window_budget_mist: u64 }
 
 // === Create ===
 
@@ -356,6 +365,36 @@ public fun top_up(policy: &mut AgentPolicy, cap: &PolicyOwnerCap, added_mist: u6
         added_mist,
         budget_mist: policy.budget_mist,
     });
+}
+
+/// Raise or lower the per-transaction hard cap (owner only). The cap is re-read
+/// on-chain on every spend, so this takes effect on the next action.
+public fun set_max_per_tx(policy: &mut AgentPolicy, cap: &PolicyOwnerCap, max_per_tx_mist: u64) {
+    assert_owner(policy, cap);
+    policy.max_per_tx_mist = max_per_tx_mist;
+    event::emit(MaxPerTxSet { policy_id: object::id(policy), max_per_tx_mist });
+}
+
+/// Set the lifetime budget to an absolute value (owner only). Refuses a value below
+/// what has already been spent, which would break the spent <= budget invariant.
+/// (`top_up` remains available for increase-only.)
+public fun set_budget(policy: &mut AgentPolicy, cap: &PolicyOwnerCap, budget_mist: u64) {
+    assert_owner(policy, cap);
+    assert!(budget_mist >= policy.spent_mist, EBudgetBelowSpent);
+    policy.budget_mist = budget_mist;
+    event::emit(BudgetSet { policy_id: object::id(policy), budget_mist });
+}
+
+/// Set the rolling per-window spend budget (owner only). `window_ms` is unchanged;
+/// this bounds how much may be spent within each window.
+public fun set_window_budget(
+    policy: &mut AgentPolicy,
+    cap: &PolicyOwnerCap,
+    window_budget_mist: u64,
+) {
+    assert_owner(policy, cap);
+    policy.window_budget_mist = window_budget_mist;
+    event::emit(WindowBudgetSet { policy_id: object::id(policy), window_budget_mist });
 }
 
 /// Rotate the delegated agent address (e.g. after a key rotation).
