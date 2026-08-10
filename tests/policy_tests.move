@@ -26,6 +26,35 @@ fun mk(
 }
 
 #[test]
+/// The coin allowlist matches ONLY the canonical `type_name` encoding. Adding a coin
+/// via `coin_type_bytes<T>()` makes it allowed; a hand-typed short `0x…` form is a
+/// different byte string that never matches (guards the docstring footgun in #5).
+fun coin_allowlist_matches_canonical_encoding() {
+    let mut ctx = tx_context::dummy();
+    let clk = clock::create_for_testing(&mut ctx);
+    // The helper reproduces exactly what enforce_spend derives.
+    assert!(policy::coin_type_bytes<SUI>() == sui_type());
+    assert!(policy::coin_type_bytes<SUI>() != b"0x2::sui::SUI");
+
+    // Non-empty allowlist that doesn't yet include SUI → SUI is blocked.
+    let (mut policy, cap) = mk(1000, 1000, 0, vector[b"0x0::nope::NOPE"], vector[], &mut ctx);
+    assert!(!policy.would_allow<SUI>(100, @0x0, &clk));
+    // Add via the helper → SUI now passes the coin gate.
+    policy.add_allowed_coin(&cap, policy::coin_type_bytes<SUI>());
+    assert!(policy.would_allow<SUI>(100, @0x0, &clk));
+
+    // A policy seeded with the short form instead never matches SUI.
+    let (p2, c2) = mk(1000, 1000, 0, vector[b"0x2::sui::SUI"], vector[], &mut ctx);
+    assert!(!p2.would_allow<SUI>(100, @0x0, &clk));
+
+    destroy(policy);
+    destroy(cap);
+    destroy(p2);
+    destroy(c2);
+    clock::destroy_for_testing(clk);
+}
+
+#[test]
 fun spends_within_limits_and_accrues() {
     let mut ctx = tx_context::dummy();
     let clk = clock::create_for_testing(&mut ctx);

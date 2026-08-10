@@ -494,9 +494,20 @@ public fun set_allowed_protocols(
     emit_protocol_changed(policy);
 }
 
-/// Authorize a coin type — the fully-qualified type name as ascii bytes, e.g.
-/// `b"0x2::sui::SUI"` (idempotent, no-op if already present). Matches the encoding
-/// `enforce_spend` derives from `type_name::with_defining_ids<T>()`.
+/// Derive the exact allowlist bytes for coin type `T` — the canonical `type_name`
+/// encoding `enforce_spend` compares against: fully zero-padded address, NO `0x`
+/// prefix (e.g. `0000…0002::sui::SUI`). Call this (e.g. via devInspect) to get the
+/// value to pass to `add_allowed_coin`, instead of hand-typing bytes that silently
+/// won't match.
+public fun coin_type_bytes<T>(): vector<u8> {
+    type_name::with_defining_ids<T>().into_string().into_bytes()
+}
+
+/// Authorize a coin type — the fully-qualified `type_name` bytes in CANONICAL form
+/// (zero-padded address, NO `0x` prefix, e.g. `b"0000…0002::sui::SUI"`). Derive the
+/// exact value with `coin_type_bytes<T>()`; a short form like `b"0x2::sui::SUI"` is a
+/// DIFFERENT byte string that never matches what `enforce_spend` compares against, so
+/// it would silently block the coin. Idempotent (no-op if already present).
 public fun add_allowed_coin(policy: &mut AgentPolicy, cap: &PolicyOwnerCap, coin_type: vector<u8>) {
     assert_owner(policy, cap);
     if (allowlist::insert_bytes(&mut policy.allowed_coins, coin_type)) {
@@ -517,6 +528,8 @@ public fun remove_allowed_coin(
 }
 
 /// Replace the entire coin allowlist. An empty vector means ANY coin is permitted.
+/// Each entry must be canonical `type_name` bytes — derive them with
+/// `coin_type_bytes<T>()` (see `add_allowed_coin`).
 public fun set_allowed_coins(
     policy: &mut AgentPolicy,
     cap: &PolicyOwnerCap,
