@@ -118,6 +118,27 @@ fun window_resets_after_elapse() {
     clock::destroy_for_testing(clk);
 }
 
+#[test]
+/// `would_allow` must mirror the rolling-window bound `enforce_spend` applies —
+/// previously it ignored the window, so the preview said "yes" to a spend that
+/// `enforce_spend` aborts with `EOverWindow`.
+fun would_allow_respects_window() {
+    let mut ctx = tx_context::dummy();
+    let clk = clock::create_for_testing(&mut ctx);
+    // lifetime 10_000, per-tx 500, window 1000ms / 600 per window.
+    let (mut policy, cap) =
+        policy::new_windowed_policy_for_testing(AGENT, 10_000, 500, 1000, 600, &mut ctx);
+    let r1 = policy.enforce_spend<SUI>(400, @0x0, b"swap", b"", &clk, &mut ctx);
+    destroy(r1);
+    // 400 + 300 = 700 > 600 window budget → preview says NO (within per-tx + lifetime).
+    assert!(!policy.would_allow<SUI>(300, @0x0, &clk));
+    // 400 + 200 = 600 fits the window → YES.
+    assert!(policy.would_allow<SUI>(200, @0x0, &clk));
+    destroy(policy);
+    destroy(cap);
+    clock::destroy_for_testing(clk);
+}
+
 #[test, expected_failure(abort_code = lyra::policy::ERevoked)]
 fun blocks_when_revoked() {
     let mut ctx = tx_context::dummy();
