@@ -4,18 +4,25 @@
 /// generic over the coin type `T`, so one owner can hold several — `Vault<SUI>`,
 /// `Vault<USDC>`, any bridged asset — all bound to the same `AgentPolicy`.
 ///
-/// The delegated agent has exactly two ways to move funds out, and NEITHER hands
-/// it a coin it can keep:
-///   • `vault_transfer` — sends to a recipient, enforcing the policy's recipient
-///     allowlist on-chain.
+/// The delegated agent has three ways to move funds out, each re-running the full
+/// `lyra::policy` gate on-chain (agent identity, per-tx cap, rolling window +
+/// lifetime budget, coin/protocol allowlists, expiry, revoke, version):
+///   • `vault_transfer` — sends to a recipient, additionally enforcing the policy's
+///     recipient allowlist on-chain. This is the ONLY path the recipient allowlist
+///     binds.
 ///   • `vault_borrow` + `vault_settle` — draws a coin for a protocol action (swap /
-///     lend / stake) as a `FlashSpend` HOT POTATO that must be settled by
-///     depositing the resulting asset back into a same-policy vault.
-/// Both re-run the full `lyra::policy` gate on-chain (agent identity, per-tx cap,
-/// rolling window + lifetime budget, coin/protocol allowlists, expiry, revoke,
-/// version). So a compromised agent key — or a leaked server signing key — is
-/// bounded by the policy and the per-window budget, and revocable by the owner,
-/// who can also pull the whole treasury back anytime with `owner_withdraw`.
+///     lend / stake) as a `FlashSpend` HOT POTATO that must be settled by depositing
+///     an asset back into a same-policy vault. NOTE: the settle amount is not
+///     value-checked (a swap's output type/decimals differ from the input and vary
+///     with slippage — an on-chain check would need a price oracle), so the honest
+///     path returns the swapped value while a compromised agent's exposure on this
+///     path is bounded by the budget/window/per-tx cap, same as `vault_spend_capped`.
+///   • `vault_spend_capped` — raw draw for staking/lending whose output can't return
+///     to a vault; deliberate standing exposure, window-bounded, named-protocol only.
+/// So a compromised agent key — or a leaked server signing key — cannot move more
+/// than the policy's per-window / lifetime budget allows, and the owner can revoke
+/// or pull the whole treasury back anytime with `owner_withdraw`. The budget +
+/// rolling window are the blast-radius bound; per-path value return is not.
 ///
 /// Version guard: the agent spend path asserts the vault is at the running package
 /// version, but `deposit` and `owner_withdraw` never do — so an upgrade can pause
@@ -169,12 +176,16 @@ entry fun deposit_entry<T>(vault: &mut Vault<T>, coin: Coin<T>) {
 
 // === Spend (agent, policy-enforced) ===
 
-/// A hot-potato proof that funds were drawn from a vault and MUST be returned. It
-/// has NO abilities (no drop/store/key/copy), so the only thing a PTB can do with
-/// it is pass it to `vault_settle` — which deposits value back into a vault under
-/// the SAME policy. This is what removes the old unchecked-exit hole: the agent can
-/// no longer draw a raw coin and keep it, and the recipient allowlist on
-/// `vault_transfer` is now meaningful (there is no raw-coin path around it).
+/// A hot-potato proof that funds were drawn from a vault. It has NO abilities (no
+/// drop/store/key/copy), so the only thing a PTB can do with it is pass it to
+/// `vault_settle` — which deposits a coin back into a vault under the SAME policy and
+/// destroys the potato. The potato forces the round-trip to CLOSE in the same PTB;
+/// it does NOT enforce how much comes back (`vault_settle` accepts any amount, since
+/// a swap's output type/value is only knowable off-chain). The bound against a
+/// compromised agent is therefore the `enforce_spend` budget/window/per-tx cap
+/// charged in `vault_borrow`, NOT a value-return guarantee — this path can move up
+/// to that bound to an arbitrary destination, exactly like `vault_spend_capped`. The
+/// recipient allowlist binds `vault_transfer` only; it does not apply here.
 public struct FlashSpend {
     policy_id: ID,
     borrowed: u64,

@@ -333,3 +333,36 @@ fun migrate_restores_agent_spend() {
     destroy(cap);
     clock::destroy_for_testing(clk);
 }
+
+#[test, expected_failure(abort_code = lyra::policy::EOverWindow)]
+/// The blast-radius bound holds on the borrow path even when the agent ABUSES it:
+/// `vault_settle` doesn't value-check the return, so an agent can borrow, pocket the
+/// coin (settle a ZERO coin), and pay an arbitrary address — but every borrow still
+/// runs `enforce_spend`, so a burst past the rolling-window budget aborts. This locks
+/// the actual guarantee (budget/window bounded), which the docs now state plainly.
+fun vault_borrow_pocket_is_still_window_bounded() {
+    let mut ctx = tx_context::dummy();
+    let clk = clock::create_for_testing(&mut ctx);
+    // window 1000ms / 600 per window, per-tx 500, lifetime 10_000.
+    let (mut policy, cap) =
+        policy::new_windowed_policy_for_testing(AGENT, 10_000, 500, 1000, 600, &mut ctx);
+    let mut v = vault::new<SUI>(&policy, &mut ctx);
+    vault::deposit(&mut v, coin::mint_for_testing<SUI>(10_000, &mut ctx));
+
+    // Borrow 400 and pocket it: settle a ZERO coin, send the real coin to @0xBAD.
+    let (c1, f1) =
+        vault::vault_borrow<SUI>(&mut v, &mut policy, 400, @0x0, b"swap", b"", &clk, &mut ctx);
+    transfer::public_transfer(c1, @0xBAD);
+    vault::vault_settle<SUI>(&mut v, f1, coin::zero<SUI>(&mut ctx));
+
+    // Second borrow in the SAME window: 400 + 300 = 700 > 600 → aborts EOverWindow.
+    let (c2, f2) =
+        vault::vault_borrow<SUI>(&mut v, &mut policy, 300, @0x0, b"swap", b"", &clk, &mut ctx);
+    transfer::public_transfer(c2, @0xBAD);
+    vault::vault_settle<SUI>(&mut v, f2, coin::zero<SUI>(&mut ctx));
+
+    destroy(v);
+    destroy(policy);
+    destroy(cap);
+    clock::destroy_for_testing(clk);
+}

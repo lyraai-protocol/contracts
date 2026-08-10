@@ -325,7 +325,9 @@ entry fun record_action<T>(
 }
 
 /// Pure, read-only preview used by tests and off-chain dry-runs: true when an
-/// action of `amount_mist` in coin `T` via `protocol` would pass right now.
+/// action of `amount_mist` in coin `T` via `protocol` would pass right now. Mirrors
+/// EVERY check `enforce_spend` makes — including the rolling-window budget, so the
+/// preview can't say "yes" to a spend that would abort on `EOverWindow`.
 public fun would_allow<T>(
     policy: &AgentPolicy,
     amount_mist: u64,
@@ -338,6 +340,7 @@ public fun would_allow<T>(
         && (policy.expiry_ms == 0 || clock.timestamp_ms() <= policy.expiry_ms)
         && amount_mist <= policy.max_per_tx_mist
         && policy.spent_mist + amount_mist <= policy.budget_mist
+        && window_would_allow(policy, amount_mist, clock.timestamp_ms())
         && coin_allowed(policy, &type_name::with_defining_ids<T>().into_string().into_bytes())
         && protocol_allowed(policy, protocol)
 }
@@ -590,6 +593,17 @@ fun protocol_allowed(policy: &AgentPolicy, protocol: address): bool {
     // plain transfer or swap. Otherwise: empty allowlist = any, else must be listed.
     protocol == constants::no_protocol()
         || allowlist::allows_addr(&policy.allowed_protocols, protocol)
+}
+
+/// Read-only mirror of `enforce_spend`'s rolling-window check: would `amount_mist`
+/// fit the per-window budget at `now`? A disabled window (`window_ms == 0`) never
+/// constrains; otherwise an elapsed window is treated as reset (spent → 0), exactly
+/// as `enforce_spend` would reset it before charging.
+fun window_would_allow(policy: &AgentPolicy, amount_mist: u64, now: u64): bool {
+    if (policy.window_ms == 0) return true;
+    let effective_spent = if (now >= policy.window_start_ms + policy.window_ms) 0
+    else policy.window_spent_mist;
+    effective_spent + amount_mist <= policy.window_budget_mist
 }
 
 fun emit_protocol_changed(policy: &AgentPolicy) {
